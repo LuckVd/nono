@@ -51,6 +51,12 @@ pub enum RawSandboxStage {
     RestrictSelf,
     InstallStaticFilter,
     InstallNotifyFilter,
+    /// `unshare(2)` of the requested namespace set.
+    UnshareNamespaces,
+    /// Bringing up the loopback interface inside a new network namespace.
+    LoopbackUp,
+    /// Creating the loopback bridge listener inside a new network namespace.
+    BridgeListener,
 }
 
 /// Fixed-size error returned by child-safe sandbox operations.
@@ -65,6 +71,10 @@ pub struct RawSandboxError {
 }
 
 impl RawSandboxError {
+    pub(crate) fn new(stage: RawSandboxStage, errno: i32) -> Self {
+        Self { stage, errno }
+    }
+
     #[must_use]
     pub fn stage(self) -> RawSandboxStage {
         self.stage
@@ -76,7 +86,7 @@ impl RawSandboxError {
     }
 }
 
-fn raw_errno() -> i32 {
+pub(crate) fn raw_errno() -> i32 {
     // SAFETY: errno is thread-local and the pointer is valid for this thread.
     unsafe { *libc::__errno_location() }
 }
@@ -1738,6 +1748,14 @@ mod arch_guard {
     impl<T: AsRef<[SockFilterInsn]>> ArchGuarded<T> {
         pub(super) fn as_slice(&self) -> &[SockFilterInsn] {
             self.0.as_ref()
+        }
+    }
+
+    impl<const N: usize> ArchGuarded<[SockFilterInsn; N]> {
+        /// Move an already-guarded fixed-size program onto the heap. The
+        /// prologue is carried over unchanged, so the invariant still holds.
+        pub(super) fn into_vec(self) -> ArchGuarded<Vec<SockFilterInsn>> {
+            ArchGuarded(self.0.to_vec())
         }
     }
 
@@ -3430,6 +3448,18 @@ pub fn install_seccomp_af_unix_filter() -> Result<std::os::fd::OwnedFd> {
 pub fn prepare_seccomp_af_unix_filter() -> PreparedSeccompNotifyFilter {
     PreparedSeccompNotifyFilter {
         filter: build_seccomp_af_unix_filter(),
+    }
+}
+
+/// Prepare the openat-only seccomp notification program for raw clone.
+///
+/// Used when a raw-clone child needs filesystem notifications but no network
+/// notifications, for example under namespace isolation without the proxy
+/// fallback. The program is the one [`install_seccomp_notify`] installs.
+#[must_use]
+pub fn prepare_seccomp_openat_filter() -> PreparedSeccompNotifyFilter {
+    PreparedSeccompNotifyFilter {
+        filter: build_seccomp_openat_notify_filter().into_vec(),
     }
 }
 

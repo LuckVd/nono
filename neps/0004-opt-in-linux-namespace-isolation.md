@@ -3,7 +3,7 @@ nep: 0004
 title: Opt-in Linux namespace isolation
 authors:
   - lukehinds
-status: draft
+status: proposed
 created: 2026-09-29
 superseded-by:
 ---
@@ -100,7 +100,8 @@ rule. Opt-in keeps nono completely userland-purposed by default.
 - PID namespaces in the initial phases (PID-1 init/reaping semantics,
   `/proc` remount coupling) — explicitly deferred, revisit after Phase 2.
 - Inbound reverse-forwarding for `bind_ports` across the netns boundary —
-  deferred (Phase 1 documents the limitation).
+  deferred. Phase 1 rejects `bind_ports` combined with `isolate.network`
+  at startup (see "Interaction with `NetworkMode`").
 - veth/pasta/slirp-style real IP connectivity inside the namespace: it
   would bypass proxy domain filtering. All egress remains proxy-brokered.
 - Replacing the parallel work of adopting Landlock ABI 7–11 as kernel and
@@ -138,27 +139,59 @@ Interaction with `NetworkMode`:
 | `ProxyOnly` | Proxy bridge (below). |
 | `AllowAll` | **Configuration error.** Allow-all cannot be satisfied inside an empty namespace; failing at startup is required rather than silently blocking everything the profile said to allow. |
 
-**Proxy bridge (Phase 1, ProxyOnly only).** Pathname AF_UNIX sockets are
-filesystem-routed and therefore cross netns boundaries — the one property
-that makes them an escape class becomes the transport:
+The same reasoning applies to every grant of direct (non-proxied) reachability.
+Combined with `isolate.network`, each of the following is a **configuration
+error** at startup. The error names the offending field and the profile layer
+that set it:
 
-1. `nono-proxy` (in the supervisor process, outside the sandbox) gains a
-   Unix-socket listener alongside its TCP listener, in a supervisor-owned
-   `0700` directory covered by the child's capability set as the sole
-   socket grant.
-2. A small relay process is started inside the namespace before the
-   workload `exec`s. It listens on `127.0.0.1:<port>` inside the netns and
-   relays byte-for-byte to the proxy's Unix socket. It is itself fully
-   sandboxed (same Landlock/seccomp state as the workload), holds no
-   credentials, and terminates with the session.
-3. The child environment (`HTTP_PROXY`/`HTTPS_PROXY`, `NONO_PROXY_TOKEN`,
-   reverse-proxy base URLs) is unchanged in shape; only the port's
-   backing transport differs. Proxy session-token authentication continues
-   to apply to every request arriving over the bridge.
+- `open_port` / `open_port_range` (`--open-port`): localhost IPC to host ports.
+  The host loopback does not exist inside the netns.
+- `connect_port` (`--allow-connect-port`): direct outbound TCP. The netns has
+  no route out.
+- `listen_port` / `listen_port_range` (`--listen-port`, `bind_ports`): inbound
+  listeners. These cannot be reached from the host until reverse forwarding
+  exists (deferred).
+- `no_proxy`: hosts that bypass the proxy. A direct connection cannot leave
+  the netns.
 
-A SOCKS5 route over the same bridge is the intended follow-up that gives
-non-HTTP TCP (SSH etc., #756) a policy-enforced path; it is part of this
-NEP's direction but may land after the initial Phase 1 PR.
+No built-in profile sets these fields today, so the rule does not make
+built-in profiles unusable with isolation.
+
+**Proxy bridge (Phase 1, ProxyOnly only).** A socket stays in the
+network namespace it was created in, whichever process later holds its
+file descriptor. The bridge uses that property, so nothing runs inside
+the namespace except the workload and no new filesystem endpoint exists:
+
+1. In the bootstrap child, after `unshare` and bringing up `lo`, the
+   child creates a TCP socket, binds it to `127.0.0.1:<port>` inside the
+   new netns (the same port number the proxy uses on the host, so the
+   child environment is unchanged), and calls `listen`. These are raw,
+   async-signal-safe syscalls and fit the existing no-alloc bootstrap.
+2. The child sends the listening fd to the supervisor over the existing
+   bootstrap socketpair (`SCM_RIGHTS`), then closes its own copy before
+   Landlock is applied and before `exec`. The workload never holds the
+   listener.
+3. The supervisor, outside the namespace, `accept()`s on the passed fd.
+   Each accepted connection belongs to the child's netns and is handed to
+   `nono-proxy`'s existing connection handler in-process, exactly as a
+   connection from the host TCP listener would be.
+4. The child environment (`HTTP_PROXY`/`HTTPS_PROXY`, `NONO_PROXY_TOKEN`,
+   reverse-proxy base URLs) is unchanged. Bridged connections get exactly
+   the proxy authentication and filtering that host-listener connections
+   get today. That includes the lenient `CONNECT` mode sandboxed sessions
+   use, where the sandbox rather than the token is the trust boundary.
+
+Compared with an in-namespace relay forwarding to a proxy Unix socket,
+this design has no relay process, no relay sandbox, no Unix-socket
+listener in `nono-proxy`, no supervisor-owned socket directory, and no
+socket grant in the child's capability set. The bridge's only state is a
+listening fd owned by the supervisor. If the supervisor dies, the session
+ends anyway.
+
+A SOCKS5 route is the intended follow-up that gives non-HTTP TCP (SSH
+etc., #756) a policy-enforced path. It uses a second passed listener and
+ships as a separate PR under this NEP, after the initial Phase 1 PR (see
+Resolved Questions).
 
 `ipc` (SysV shm/sem/msg, POSIX MQs no longer shared with the host) and
 `uts` (hostname immutable from the host's perspective) namespaces are
@@ -231,10 +264,12 @@ decisions; namespaces remain an explicit opt-in isolation decision.
 Concretely, for the pathname AF_UNIX class the resolver order is
 V9 `ResolveUnix` grant → Phase 2 mount mask → seccomp mediation →
 warn-and-continue (today's status quo). On V9 kernels the two layers
-reinforce each other: the proxy-bridge socket gets an explicit
-`ResolveUnix` grant (the bridge becomes both the only *reachable* and the
-only *granted* endpoint), and the mount mask relaxes into a recon-hiding
-role while remaining the pathname-socket defense on older kernels.
+reinforce each other. `ResolveUnix` makes the profile's explicit
+`unix_socket` grants the only pathname endpoints a workload may connect
+to. The mount mask then becomes mainly a way to hide host endpoints from
+reconnaissance, while still being the pathname-socket defense on older
+kernels. The proxy bridge is a passed TCP listener, not a pathname
+socket, so it needs no `ResolveUnix` grant.
 
 The shared infrastructure cost is CI: hosted runners will not have 7.x
 kernels for some time, so V7–V9 enforcement paths need a VM-tier kernel
@@ -281,6 +316,13 @@ existing `linux.af_unix_mediation` precedent):
 ```
 
 CLI: `--isolate net,ipc,uts,mounts` (comma list) as sugar for the same.
+
+**Merge semantics.** The boolean `isolate` fields merge like `network.block`:
+logical OR across every profile layer, packs and the CLI. Any layer can turn
+a namespace on and no layer can turn it off, so `extends` can never strip
+isolation that a base requested. `extra_masks` merges by deduplicated
+append. There is no `--no-isolate`. An operator who does not want a pack's
+isolation does not use that pack.
 `nono why` and the startup diagnostics report the effective isolation set
 and, when a namespace was requested but unavailable, which layer refused
 it. Session/audit metadata records the effective isolation set.
@@ -295,16 +337,18 @@ its existing exclusion from `af_unix_mediation`. `nono wrap` with
 Following the policy-free-primitive boundary:
 
 - **`nono` (library): mechanism.** A `NamespaceSpec` (which namespaces;
-  mask list as caller-supplied paths; bridge socket path) alongside
+  mask list as caller-supplied paths; optional loopback bridge port) alongside
   `CapabilitySet`, an availability probe (`Sandbox::probe_namespaces()`)
   that attempts the real `unshare` in a scratch child rather than reading
   sysctls, and the apply path integrated into the existing prepared
   no-alloc child bootstrap. The library applies exactly what it is given.
 - **`nono-cli` (policy).** The default mask list, the
-  `NetworkMode`-interaction rules (including rejecting
-  `AllowAll`+`network`), profile schema, flag parsing, prompts and
-  diagnostics, the relay process, and the proxy's Unix-socket listener
-  (`nono-proxy`).
+  `NetworkMode`-interaction rules (including rejecting `AllowAll` and
+  direct-reachability grants alongside `network`), profile schema, flag
+  parsing, prompts and diagnostics, and the supervisor-side accept loop
+  that feeds bridged connections to `nono-proxy`. The library's part of
+  the bridge is mechanism only: on request, create a loopback listener
+  inside the new netns and return its fd through the bootstrap channel.
 
 ### Execution mechanics
 
@@ -317,7 +361,8 @@ application and before `exec`:
    the existing synchronized bootstrap.
 2. Child (holding CAP_NET_ADMIN in its new userns) brings up `lo`; Phase 2
    performs the mask mounts.
-3. In ProxyOnly mode, the relay process is forked inside the namespace.
+3. In ProxyOnly mode, the child creates the loopback listener, passes it
+   to the supervisor over the bootstrap socketpair, and closes its copy.
 4. Landlock + seccomp apply exactly as today; `exec`.
 
 Supervisor channels are unaffected by design: the anonymous socketpair and
@@ -344,21 +389,28 @@ meaning. The library additions are new API only.
 
 - **Least privilege.** Isolation only ever *removes* reachability; it
   grants the sandboxed process nothing new. The two additions of authority
-  are scoped: CAP_NET_ADMIN etc. exist only within the child's own user
-  namespace (they confer nothing over host resources), and the proxy's
-  Unix socket is a single, supervisor-owned, token-authenticated endpoint
-  in a `0700` directory — narrower than the localhost TCP port it
-  replaces, which any host process could probe.
+  are scoped. CAP_NET_ADMIN and the other capabilities exist only within
+  the child's own user namespace and confer nothing over host resources.
+  The proxy bridge is a listener reachable only from inside the child's
+  netns and is token-authenticated. That is narrower than the host
+  localhost TCP port it replaces, which any host process could probe.
 - **Fail-secure.** Requested-but-unavailable isolation is a startup
   error, never a silent downgrade — matching the
   `SignalMode::AllowSameSandbox` fail-closed precedent. The probe attempts
   the actual operation (AppArmor, seccomp, and sysctl denials all surface
   as `EPERM` from different layers; the diagnostic names the layer and the
   fix, e.g. the per-binary AppArmor profile nono will ship/document for
-  Ubuntu 24.04+). `AllowAll`+`network` is rejected at configuration time.
-  Relay-process death closes the bridge: the child loses proxy access and
-  nothing widens. Partial namespace application in the bootstrap is fatal
-  to the launch, not recoverable.
+  Ubuntu 24.04+). `AllowAll` and every direct-reachability grant are
+  rejected at configuration time when combined with `isolate.network`.
+  A failure to create or pass the bridge listener is fatal to the launch.
+  The workload never holds the listener, so it cannot accept or hijack
+  bridged connections. Partial namespace application in the bootstrap is
+  fatal to the launch, not recoverable.
+- **AppArmor profile trade.** The shipped Ubuntu profile grants `userns`
+  to the nono binary only. Any local user can then use nono to obtain an
+  unprivileged user namespace, the same exposure Ubuntu accepts for its
+  bubblewrap profile. The profile is an operator install step, never a
+  default, and the docs state this trade.
 - **Kernel attack surface (the honest trade).** Unprivileged user
   namespaces expose kernel interfaces behind which a long lineage of
   privilege-escalation bugs has lived — that is precisely why Ubuntu
@@ -383,14 +435,18 @@ meaning. The library additions are new API only.
   mask path.
 - **Credential secrecy.** Unchanged: credentials remain in the
   supervisor-side proxy as `Zeroizing<String>` and are injected upstream
-  only. The in-namespace relay is untrusted, sandboxed, and carries only
-  ciphertext-equivalent traffic it could already see as the workload's
-  peer; the session token continues to authenticate every bridged request
-  with constant-time comparison. The bridge socket path appears in
-  diagnostics but is not secret.
+  only. No relay component runs inside the namespace.
+  Bridged connections terminate directly in the supervisor-side proxy
+  and are authenticated exactly as host-listener connections are: forward
+  and reverse requests require the session token (constant-time
+  comparison), and sandboxed `CONNECT` stays lenient, as today. The bridge
+  is reachable only from inside the child's netns. That is a tighter
+  boundary than the host loopback listener, which any host process can
+  reach.
 - **Profile trust.** `extra_masks` is additive-only; no profile layer may
   remove a default mask. A pack cannot use `isolate` to widen anything:
-  every field only narrows.
+  every field only narrows, and OR-merge semantics mean no layer can
+  remove isolation a base requested.
 - **What this does not fix.** Proxy-layer (L7) policy bugs become *more*
   load-bearing as the proxy becomes the sole egress chokepoint; filesystem
   capability policy, command policy, approval flows, and macOS enforcement
@@ -422,9 +478,19 @@ meaning. The library additions are new API only.
   PID 1 init, synthetic rootfs).** Rejected as scope creep. nono's
   differentiator is the fine-grained capability model; namespaces here are
   a membrane around that model, not a container runtime growing inside
-  it. bubblewrap/sandbox-runtime remain the reference for the proxy-bridge
-  pattern (proven in production by Anthropic's sandbox-runtime for Claude
-  Code), not the product direction.
+  it. bubblewrap/sandbox-runtime remain the reference for brokering all
+  egress from an empty netns through a host-side proxy (proven in
+  production by Anthropic's sandbox-runtime for Claude Code), not the
+  product direction.
+- **In-namespace relay process to a proxy Unix socket** (the bridge
+  shape in the original draft of this NEP). Superseded by passing the
+  netns loopback listener fd to the supervisor. The relay design worked,
+  but it added an extra process inside the sandbox, a relay sandbox to
+  maintain, a filesystem socket endpoint and its grant, a Unix listener
+  in `nono-proxy`, and a relay-death failure mode. It also had to answer
+  how the relay is launched (a re-exec of `nono` or a separate binary),
+  which needs exec rights on that binary before Landlock applies. The
+  fd-passing design needs none of this.
 - **pasta/slirp4netns user-mode networking inside the netns.** Rejected:
   restores raw IP reachability and therefore bypasses proxy domain
   filtering; nono's network policy is domain/route-level, so all egress
@@ -458,33 +524,68 @@ meaning. The library additions are new API only.
   Where privileged setup is genuinely needed, it stays outside nono:
   see "Externally provisioned namespaces" in the Proposal.
 
+## Resolved Questions
+
+Questions raised in the draft, with the resolutions this NEP proposes.
+
+- **Pack semantics.** Any profile layer, packs included, may request
+  isolation, and the request is mandatory. A host that cannot provide it
+  fails at startup, and the error names the layer that set the field.
+  Isolation only narrows, so letting a pack request it widens nothing.
+  Silently dropping a pack's request would be a fail-open downgrade.
+  Fields merge by OR, like `network.block` (see "Merge semantics"). A
+  cross-platform `require_isolation` is out of scope. On macOS `isolate`
+  stays inert, and `nono why` says so instead of claiming an equivalent
+  boundary.
+- **`bind_ports` in Phase 1.** Startup error, not a warning. A warning
+  would start a session whose listeners can never be reached, which
+  fails in confusing ways later. The error covers every
+  direct-reachability grant (`open_port*`, `connect_port`,
+  `listen_port*`, `no_proxy`), because each one fails inside the netns
+  for the same reason. Revisit when reverse forwarding is designed.
+  Reverse forwarding still needs something able to create sockets inside
+  the netns after `exec`, which the fd-passing bridge does not provide.
+- **Relay implementation shape.** No relay. The bootstrap child creates
+  the loopback listener inside the netns and passes it to the supervisor
+  (see "Proxy bridge"). SOCKS5 is a second passed listener, shipped as a
+  follow-up PR under this NEP and not in the initial Phase 1 PR. It opens
+  a new egress class (non-HTTP TCP) whose policy surface deserves its own
+  review, and Phase 1 without it matches today's ProxyOnly semantics
+  exactly.
+- **Default mask list (Phase 2).** Starting list: `$XDG_RUNTIME_DIR`
+  (D-Bus session bus, systemd user manager, Wayland, PipeWire, rootless
+  Podman, keyring and agent sockets), `/run/dbus`, `/run/docker.sock`
+  and `/var/run/docker.sock`, `/run/containerd/containerd.sock`,
+  `/run/podman/podman.sock`, `/run/snapd.socket`, and `/run/systemd/private`.
+  The per-session `/tmp` also hides `/tmp/.X11-unix` and `/tmp/ssh-*`
+  agent sockets. GUI and `ssh-agent` access therefore breaks under
+  `mounts` unless granted. That is acceptable for an opt-in mask, and
+  explicit grants re-bind through the mask. The list lives in `nono-cli`
+  policy. Any change to it is reviewed as a security change. The
+  Phase 2 PR finalizes the list against real agent workloads, and
+  later changes are reviewed per release, not on a fixed schedule.
+- **WSL2.** Expected to work but unverified. The Phase 1 PR adds a WSL2
+  feature-matrix row marked "Unverified" until tested on the Microsoft
+  6.6 kernel. The probe decides at runtime either way, so an unsupported
+  host fails closed. It is worth verifying because the netns provides
+  kernel-enforced ProxyOnly without seccomp user notification, which is
+  unavailable on WSL2 (EBUSY). The docs will not claim that until it is
+  verified.
+- **Ubuntu AppArmor profile distribution.** Both. The `.deb` (built with
+  `cargo-deb`) ships an AppArmor profile that grants `userns` to the
+  installed nono binary path. The docs give the manual install step for
+  other install methods. When the probe fails with `EPERM` and
+  `kernel.apparmor_restrict_unprivileged_userns` is `1`, the diagnostic
+  names AppArmor as the refusing layer and prints the profile path or
+  install command. Sysctls are read only to explain a failed probe,
+  never to decide availability. See Security Considerations for the
+  trade this profile makes.
+
 ## Open Questions
 
-- **Pack semantics:** may a pack/profile *require* isolation (fail on
-  hosts without userns), or is isolation strictly a top-level operator
-  decision that packs can request but not mandate? Related: should a
-  future `require_isolation` express "fail if the platform cannot provide
-  an equivalent boundary" and what, if anything, that means on macOS.
-- **`bind_ports` UX in Phase 1:** inbound listeners (MCP servers) bound
-  inside the netns are unreachable from the host until reverse forwarding
-  exists. Startup error when `bind_ports` is combined with
-  `isolate.network`, or permitted with a prominent warning?
-- **Default mask list contents and review cadence** for Phase 2
-  (`$XDG_RUNTIME_DIR`, `/run/dbus`, `docker.sock`, what else — Wayland
-  and X11 sockets break GUI tooling if masked by default; curate the
-  list against real agent workloads).
-- **Relay implementation shape:** re-exec of the `nono` binary in a
-  hidden subcommand vs. a dedicated minimal binary; and whether the
-  SOCKS5 route ships in the Phase 1 PR or immediately after.
-- **WSL2:** userns and netns are expected to work (real kernel), but the
-  WSL2 feature matrix needs explicit verification and a row for
-  isolation.
-- **Ubuntu AppArmor profile distribution:** ship in packages, document
-  as an install step, or both; and how the probe's diagnostic points at
-  it.
-- **Companion NEP scope for ABI 9 `ResolveUnix`:** the migration
-  semantics (curated system-default unix-socket grants, the
-  `af_unix_mediation` demotion timeline, and how the enforcement
-  resolver's per-class choice is reported and audited) need their own
-  decision record — this NEP only fixes the composition contract with
-  it.
+- **Companion NEP scope for ABI 9 `ResolveUnix`** (deferred, not
+  blocking). The migration semantics need their own decision record:
+  curated system-default unix-socket grants, the `af_unix_mediation`
+  demotion timeline, and how the enforcement resolver's per-class choice
+  is reported and audited. This NEP fixes only the composition contract
+  with it.

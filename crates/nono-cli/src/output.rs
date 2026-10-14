@@ -512,6 +512,28 @@ pub fn print_abi_info(silent: bool) {
 
 /// Print the Landlock scope policy derived from the current capabilities.
 #[cfg(target_os = "linux")]
+/// Print the requested namespace isolation set (NEP-0004), if any.
+#[cfg(target_os = "linux")]
+pub fn print_isolation(isolate: crate::profile::LinuxIsolateConfig, silent: bool) {
+    if silent || isolate.is_empty() {
+        return;
+    }
+    let t = theme::current();
+    let detail = if isolate.network {
+        "user namespace; network: loopback only, any egress via the nono proxy"
+    } else {
+        "user namespace"
+    };
+    eprintln!(
+        "  {} {}",
+        badge(" iso ", t.blue, BADGE_FG_DARK),
+        fg(
+            &format!("namespaces: {} ({detail})", isolate.labels().join(", ")),
+            t.subtext,
+        )
+    );
+}
+
 pub fn print_landlock_scope_policy(caps: &CapabilitySet, verbose: u8, silent: bool) {
     if silent || verbose == 0 {
         return;
