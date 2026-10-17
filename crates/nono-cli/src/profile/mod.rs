@@ -2365,6 +2365,10 @@ pub struct LinuxIsolateConfig {
     /// possible only through the session proxy bridge.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub network: bool,
+    /// Allow TCP bind and connect on any port inside the isolated network
+    /// namespace's own loopback. Requires `network`. Egress stays proxy-only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loopback: bool,
     /// New IPC namespace (SysV IPC and POSIX message queues).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ipc: bool,
@@ -2377,7 +2381,7 @@ impl LinuxIsolateConfig {
     /// Whether no namespace is requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.network && !self.ipc && !self.uts
+        !self.network && !self.loopback && !self.ipc && !self.uts
     }
 
     /// OR-merge: the result requests every namespace either side requests.
@@ -2385,6 +2389,7 @@ impl LinuxIsolateConfig {
     pub fn merge(self, other: Self) -> Self {
         Self {
             network: self.network || other.network,
+            loopback: self.loopback || other.loopback,
             ipc: self.ipc || other.ipc,
             uts: self.uts || other.uts,
         }
@@ -2393,10 +2398,15 @@ impl LinuxIsolateConfig {
     /// Short names of the requested namespaces, for diagnostics.
     #[must_use]
     pub fn labels(&self) -> Vec<&'static str> {
-        [(self.network, "net"), (self.ipc, "ipc"), (self.uts, "uts")]
-            .into_iter()
-            .filter_map(|(on, label)| on.then_some(label))
-            .collect()
+        [
+            (self.network, "net"),
+            (self.loopback, "loopback"),
+            (self.ipc, "ipc"),
+            (self.uts, "uts"),
+        ]
+        .into_iter()
+        .filter_map(|(on, label)| on.then_some(label))
+        .collect()
     }
 }
 
@@ -7295,6 +7305,7 @@ mod tests {
                 network: true,
                 ipc: false,
                 uts: true,
+                ..Default::default()
             }
         );
     }
@@ -7322,6 +7333,24 @@ mod tests {
         );
         assert!(merged.linux.isolate.ipc, "child can add isolation");
         assert!(!merged.linux.isolate.uts);
+    }
+
+    #[test]
+    fn test_profile_parses_and_merges_isolate_loopback() {
+        let profile: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"iso"},"linux":{"isolate":{"network":true,"loopback":true}}}"#,
+        )
+        .expect("parse");
+        assert!(profile.linux.isolate.loopback);
+        assert_eq!(profile.linux.isolate.labels(), vec!["net", "loopback"]);
+
+        let mut base = base_profile();
+        base.linux.isolate.loopback = true;
+        let child: Profile = serde_json::from_str(
+            r#"{"meta":{"name":"child"},"linux":{"isolate":{"loopback":false}}}"#,
+        )
+        .expect("parse");
+        assert!(merge_profiles(base, child).linux.isolate.loopback);
     }
 
     #[test]

@@ -193,6 +193,88 @@ etc., #756) a policy-enforced path. It uses a second passed listener and
 ships as a separate PR under this NEP, after the initial Phase 1 PR (see
 Resolved Questions).
 
+**Namespace-private loopback (opt-in, Phase 1 follow-up; accepted).**
+
+With `isolate.network` alone, the workload cannot use its own loopback.
+nono's existing network enforcement still applies inside the namespace. Under
+`Blocked`, the static seccomp filter denies `socket(AF_INET*)` outright.
+Under `ProxyOnly`, Landlock allows TCP connect only to the proxy port and
+allows no bind. The seccomp-notify fallback likewise allows connects only
+to `localhost:<proxy port>`. So an isolated agent cannot run a local dev
+server, a test suite that listens on `127.0.0.1`, a language server over
+TCP, or anything else that talks to itself over loopback. This is the most
+likely reason a user would turn isolation off.
+
+That restriction exists to keep the workload from reaching *host* loopback
+services. Inside an isolated network namespace there are none. The
+namespace's loopback is private to the sandbox. Nothing on the host can
+connect to it, and it leads nowhere except back into the sandbox and to
+the proxy bridge.
+
+The proposal is an explicit opt-in:
+
+```jsonc
+{ "linux": { "isolate": { "network": true, "loopback": true } } }
+```
+
+CLI: `--isolate net,loopback`.
+
+Semantics:
+
+- `loopback` requires `network`. Requesting it without `network` is a
+  configuration error, because it would grant host-loopback reachability.
+- It permits TCP `bind`, `listen`, and `connect` on any port, IPv4 and IPv6,
+  inside the namespace. It does not permit UDP, raw sockets, or netlink.
+  Those stay exactly as they are today.
+- Egress is unchanged. The only path out of the namespace is still the
+  proxy bridge, with the same authentication and filtering.
+- The existing direct-reachability fields (`open_port*`, `connect_port`,
+  `listen_port*`, `no_proxy`) stay configuration errors under
+  `isolate.network`, with or without `loopback`. Outside isolation they
+  mean *host* loopback, and users write them to reach host services
+  (`--open-port 5432` for the local Postgres). Silently reinterpreting them
+  as namespace-local would turn a deliberate grant into something that
+  quietly does not do what was asked. A separate field makes the change
+  of scope visible.
+- `loopback` merges by OR like the other `isolate` fields.
+
+Enforcement:
+
+- Landlock's network rules filter by port only, not by address. That is
+  normally why nono cannot express "localhost only". Inside an isolated
+  network namespace the restriction is moot: the only interface is `lo`,
+  there are no routes, and the workload holds no capabilities to add any.
+  Any TCP destination the workload can reach is therefore namespace
+  loopback. For the TCP class, the namespace is the enforcement boundary.
+- Concretely, the relaxation and the namespace travel as one value. The
+  library's `NamespaceSpec` carries a `loopback_tcp` marker, which
+  `validate()` and the raw child entry refuse without a network namespace.
+  The CLI derives its TCP enforcement from the probed spec, never from the
+  request alone. With the marker set, the child's sandbox is prepared with
+  `SeccompOpts::external_tcp_with_baseline()`: Landlock does not handle
+  `BindTcp`/`ConnectTcp`, and the static seccomp filter is the TCP-only
+  baseline in every confined network mode, so under `Blocked` it switches
+  from block-all to TCP-only. The supervisor's seccomp-notify connect
+  check, which allows only `localhost:<proxy port>`, is not installed.
+  Under `--sandbox-policy landlock` (no seccomp) only the Landlock TCP
+  rules are lifted; `external` already delegates TCP. The library stays
+  mechanism-only: it applies the enforcement it is given and never
+  decides that isolation makes loopback safe.
+- The proxy bridge listener is created and bound in the bootstrap child
+  before Landlock, seccomp, and `exec`. The workload therefore can never
+  bind the proxy port first (`EADDRINUSE`), and the bridge cannot be
+  displaced. Startup validation and the pre-launch re-check
+  (`prepare_namespaces`) both reject `loopback` unless the final network
+  mode is `Blocked` or `ProxyOnly` *and* `network` isolation is in effect.
+  If the namespace cannot be created, the launch fails. nono never applies
+  the relaxed TCP enforcement without the namespace that justifies it.
+
+Platform note: on macOS `linux.isolate` stays inert, so a profile that
+relies on `loopback` for a local server works on Linux but still needs
+`listen_port` on macOS. The docs must say so. Guaranteeing isolation
+across platforms (`require_isolation`) remains out of scope (see Resolved
+Questions).
+
 `ipc` (SysV shm/sem/msg, POSIX MQs no longer shared with the host) and
 `uts` (hostname immutable from the host's perspective) namespaces are
 included in Phase 1 because they are one flag each at the same `unshare`
@@ -306,6 +388,7 @@ existing `linux.af_unix_mediation` precedent):
   "linux": {
     "isolate": {
       "network": true,        // Phase 1: user+net (+ipc+uts)
+      "loopback": true,       // Phase 1 follow-up: TCP on the namespace's own lo; requires network
       "ipc": true,            // may also be set without network
       "uts": true,
       "mounts": true,         // Phase 2: user+mnt, default mask list
@@ -315,7 +398,7 @@ existing `linux.af_unix_mediation` precedent):
 }
 ```
 
-CLI: `--isolate net,ipc,uts,mounts` (comma list) as sugar for the same.
+CLI: `--isolate net,loopback,ipc,uts,mounts` (comma list) as sugar for the same.
 
 **Merge semantics.** The boolean `isolate` fields merge like `network.block`:
 logical OR across every profile layer, packs and the CLI. Any layer can turn
@@ -406,6 +489,22 @@ meaning. The library additions are new API only.
   The workload never holds the listener, so it cannot accept or hijack
   bridged connections. Partial namespace application in the bootstrap is
   fatal to the launch, not recoverable.
+- **Namespace-private loopback.** `isolate.loopback` is the one place
+  where isolation *relaxes* another layer: Landlock TCP rules and the
+  seccomp network filter are lifted for TCP. The relaxation is sound only
+  while the workload sits in a network namespace with nothing but `lo`,
+  no routes, and no capabilities. So the namespace and the relaxation must
+  be applied together or not at all. The library takes them as one
+  instruction from the CLI. The CLI rejects `loopback` without `network`
+  at validation and again at launch, and a failure to create the
+  namespace is fatal. The residual exposure is sandbox-to-sandbox only. A
+  workload can reach its own loopback listeners and the proxy bridge,
+  which it can already reach. File descriptors from the host network
+  namespace are not inherited (the bootstrap scrubs fds), so no
+  host-namespace socket can be smuggled in. Tests must cover: no
+  non-loopback destination is reachable with `loopback` on, the workload
+  cannot bind the proxy port, and `loopback` without `network` fails at
+  startup.
 - **AppArmor profile trade.** The shipped Ubuntu profile grants `userns`
   to the nono binary only. Any local user can then use nono to obtain an
   unprivileged user namespace, the same exposure Ubuntu accepts for its
@@ -543,6 +642,9 @@ Questions raised in the draft, with the resolutions this NEP proposes.
   direct-reachability grant (`open_port*`, `connect_port`,
   `listen_port*`, `no_proxy`), because each one fails inside the netns
   for the same reason. Revisit when reverse forwarding is designed.
+  Listeners the workload only needs to reach itself are covered
+  separately by the opt-in `isolate.loopback` (see "Namespace-private
+  loopback"), which leaves these fields rejected.
   Reverse forwarding still needs something able to create sockets inside
   the netns after `exec`, which the fd-passing bridge does not provide.
 - **Relay implementation shape.** No relay. The bootstrap child creates
@@ -580,6 +682,12 @@ Questions raised in the draft, with the resolutions this NEP proposes.
   install command. Sysctls are read only to explain a failed probe,
   never to decide availability. See Security Considerations for the
   trade this profile makes.
+- **`isolate.loopback` port scope.** All TCP ports. Dev servers and test
+  runners pick ports dynamically, and an allow-list
+  (`"loopback": [3000, 8080]`) would be brittle while buying little,
+  because every reachable endpoint is inside the sandbox anyway. The field
+  is a boolean today; a list form can be added later without a breaking
+  change.
 
 ## Open Questions
 
@@ -589,3 +697,7 @@ Questions raised in the draft, with the resolutions this NEP proposes.
   demotion timeline, and how the enforcement resolver's per-class choice
   is reported and audited. This NEP fixes only the composition contract
   with it.
+- **UDP on the namespace loopback** (deferred, not blocking). Whether
+  `isolate.loopback` should also allow UDP (local DNS stubs, some test
+  harnesses) once Landlock ABI 10 UDP support lands. It stays TCP-only
+  until then.

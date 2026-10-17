@@ -1147,6 +1147,8 @@ preferably, use `unix_socket_dir_bind` with a dedicated directory.
 }
 ```
 
+Add `"loopback": true` (requires `network`) to let the command use TCP on the namespace's own loopback, for local dev servers and tests. Egress stays proxy-only and the host's localhost stays unreachable.
+
 Network isolation does not block pathname Unix sockets (such as `/run/docker.sock`); use `linux.af_unix_mediation` for those.
 
 #### Linux

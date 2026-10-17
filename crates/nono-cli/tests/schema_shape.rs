@@ -1114,14 +1114,18 @@ fn test_schema_linux_config_matches_rust_model() {
 #[test]
 fn test_schema_linux_isolate_config_matches_rust_model() {
     let schema = load_schema();
-    assert_schema_properties(&schema, "LinuxIsolateConfig", &["network", "ipc", "uts"]);
+    assert_schema_properties(
+        &schema,
+        "LinuxIsolateConfig",
+        &["network", "loopback", "ipc", "uts"],
+    );
 }
 
 #[test]
 fn test_schema_validates_linux_isolate() {
     let schema = load_schema();
     let validator = jsonschema::validator_for(&schema).expect("schema compiles");
-    let profile = json!({ "linux": { "isolate": { "network": true, "ipc": true, "uts": false } } });
+    let profile = json!({ "linux": { "isolate": { "network": true, "loopback": true, "ipc": true, "uts": false } } });
     validator
         .validate(&profile)
         .unwrap_or_else(|e| panic!("linux.isolate should validate: {e}"));

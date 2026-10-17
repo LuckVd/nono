@@ -11,6 +11,9 @@ nono run --isolate net,ipc,uts --block-net --allow-cwd -- my-agent
 
 # Network namespace whose only way out is the nono proxy
 nono run --isolate net --allow-domain api.openai.com --allow-cwd -- my-agent
+
+# Same, and let the agent run local servers and tests on its own loopback
+nono run --isolate net,loopback --allow-domain api.openai.com --allow-cwd -- my-agent
 ```
 
 Or in a profile:
@@ -39,6 +42,29 @@ Network isolation closes some of the same classes as Landlock's scoping and netw
 <Note>
   Pathname Unix sockets (such as `/run/user/1000/bus` or `/var/run/docker.sock`) are reached through the filesystem, so a network namespace does **not** block them. Use [`linux.af_unix_mediation`](/cli/features/networking) to control them today.
 </Note>
+
+## Local servers on loopback
+
+By default an isolated command cannot use TCP even on its own loopback. nono's normal network rules still apply inside the namespace: `--block-net` denies TCP sockets, and proxied mode allows a connection only to the proxy port. Dev servers, test suites that listen on `127.0.0.1`, and language servers over TCP all fail.
+
+Add `loopback` to allow them:
+
+```bash
+nono run --isolate net,loopback --block-net --allow-cwd -- npm test
+```
+
+```json
+{ "linux": { "isolate": { "network": true, "loopback": true } } }
+```
+
+With `loopback`, the command can bind, listen, and connect on any TCP port on `127.0.0.1` and `::1` inside the namespace. That loopback belongs only to the sandbox:
+
+- Nothing on the host can connect to these listeners, and the command still cannot reach host localhost services.
+- Egress is unchanged: the only way out is still the nono proxy, with the same filtering and authentication.
+- UDP, raw sockets, and netlink stay denied.
+- The proxy port is already held by nono's bridge listener, so the command cannot take it over.
+
+`loopback` requires `net`; on its own it is a startup error, because without the namespace it would reach the host's localhost. `--open-port`, `--listen-port`, and `--allow-connect-port` stay rejected under isolation, because they refer to the host's localhost, not the namespace's.
 
 ## Networking inside the namespace
 
@@ -93,4 +119,5 @@ Where unprivileged user namespaces cannot be enabled, create the namespace outsi
 - **`nono run` and `nono shell` only.** `nono wrap` has no supervisor to create the namespaces or serve the proxy bridge, so it rejects profiles that set `linux.isolate`.
 - **Supplementary groups** appear as `nobody` inside the namespace, because only your primary uid and gid are mapped. The kernel still applies your real groups for file access.
 - **Kernel attack surface.** Unprivileged user namespaces expose more kernel code to the sandboxed process. See the [security model](/cli/internals/security-model#opt-in-namespace-isolation-linux).
+- **`loopback` is Linux-only.** On macOS a profile that relies on it for a local server still needs `network.listen_port`.
 - **Not yet available:** a mount namespace that masks `$XDG_RUNTIME_DIR`, D-Bus, and container sockets, plus a per-session `/tmp`; a SOCKS5 route for non-HTTP TCP; and reverse forwarding for listen ports. These are planned under NEP-0004.

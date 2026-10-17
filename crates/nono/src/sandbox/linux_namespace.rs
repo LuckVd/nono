@@ -38,6 +38,7 @@ pub struct NamespaceSpec {
     ipc: bool,
     uts: bool,
     bridge_port: Option<u16>,
+    loopback_tcp: bool,
 }
 
 impl NamespaceSpec {
@@ -76,6 +77,30 @@ impl NamespaceSpec {
         self
     }
 
+    /// Mark that the caller relaxes its TCP enforcement because this network
+    /// namespace confines TCP to its own loopback. Requires `network(true)`.
+    ///
+    /// Entering the namespace is unchanged. The flag exists so the relaxation
+    /// and the namespace that justifies it travel as one value: [`validate`]
+    /// and [`enter_raw`] refuse it without a network namespace. Callers read
+    /// [`loopback_tcp_enabled`] to pick their TCP enforcement.
+    ///
+    /// [`validate`]: Self::validate
+    /// [`enter_raw`]: Self::enter_raw
+    /// [`loopback_tcp_enabled`]: Self::loopback_tcp_enabled
+    #[must_use]
+    pub fn loopback_tcp(mut self, enabled: bool) -> Self {
+        self.loopback_tcp = enabled;
+        self
+    }
+
+    /// Whether the caller relaxes TCP enforcement inside this network
+    /// namespace (see [`loopback_tcp`](Self::loopback_tcp)).
+    #[must_use]
+    pub fn loopback_tcp_enabled(&self) -> bool {
+        self.loopback_tcp
+    }
+
     /// Whether any namespace is requested.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -110,12 +135,18 @@ impl NamespaceSpec {
     ///
     /// # Errors
     ///
-    /// Returns an error when no namespace is requested, when a bridge is
-    /// requested without a network namespace, or when the bridge port is 0.
+    /// Returns an error when no namespace is requested, when a bridge or
+    /// loopback TCP is requested without a network namespace, or when the
+    /// bridge port is 0.
     pub fn validate(&self) -> Result<()> {
         if self.is_empty() {
             return Err(NonoError::SandboxInit(
                 "namespace isolation requested with an empty namespace set".to_string(),
+            ));
+        }
+        if self.loopback_tcp && !self.network {
+            return Err(NonoError::SandboxInit(
+                "loopback TCP requires a new network namespace".to_string(),
             ));
         }
         match self.bridge_port {
@@ -160,7 +191,7 @@ impl NamespaceSpec {
     ///
     /// Returns the failing stage and errno.
     pub fn enter_raw(&self) -> std::result::Result<Option<RawFd>, RawSandboxError> {
-        if self.is_empty() || (self.bridge_port.is_some() && !self.network) {
+        if self.is_empty() || ((self.bridge_port.is_some() || self.loopback_tcp) && !self.network) {
             return Err(RawSandboxError::new(
                 RawSandboxStage::UnshareNamespaces,
                 libc::EINVAL,
@@ -652,6 +683,16 @@ mod tests {
         let spec = NamespaceSpec::new().ipc(true).loopback_bridge(8080);
         assert!(spec.validate().is_err());
         assert!(spec.enter_raw().is_err());
+    }
+
+    #[test]
+    fn loopback_tcp_requires_network() {
+        let spec = NamespaceSpec::new().ipc(true).loopback_tcp(true);
+        assert!(spec.validate().is_err());
+        assert!(spec.enter_raw().is_err());
+        let spec = NamespaceSpec::new().network(true).loopback_tcp(true);
+        assert!(spec.validate().is_ok());
+        assert!(spec.loopback_tcp_enabled());
     }
 
     #[test]

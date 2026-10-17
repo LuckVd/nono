@@ -519,7 +519,9 @@ pub fn print_isolation(isolate: crate::profile::LinuxIsolateConfig, silent: bool
         return;
     }
     let t = theme::current();
-    let detail = if isolate.network {
+    let detail = if isolate.network && isolate.loopback {
+        "user namespace; network: loopback only, TCP on loopback allowed, any egress via the nono proxy"
+    } else if isolate.network {
         "user namespace; network: loopback only, any egress via the nono proxy"
     } else {
         "user namespace"

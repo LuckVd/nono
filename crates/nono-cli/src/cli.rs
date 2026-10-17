@@ -1355,7 +1355,9 @@ pub struct SandboxArgs {
 
     /// Run the command in new Linux namespaces (opt-in, NEP-0004).
     ///
-    /// Comma-separated list of: net, ipc, uts. Always adds a user namespace.
+    /// Comma-separated list of: net, loopback, ipc, uts. Always adds a user
+    /// namespace. `loopback` (requires `net`) allows TCP bind/connect on any
+    /// port of the namespace's own loopback, for local dev servers and tests.
     /// `net` leaves only loopback; egress is possible only through the session
     /// proxy, so it requires --block-net or a proxied network policy and cannot
     /// be combined with direct-access grants (--open-port, --listen-port,
@@ -1868,6 +1870,8 @@ pub struct WrapSandboxArgs {
 pub enum IsolateNamespace {
     /// Network namespace containing only loopback.
     Net,
+    /// TCP on the isolated network namespace's own loopback (requires `net`).
+    Loopback,
     /// IPC namespace.
     Ipc,
     /// UTS namespace.
@@ -1881,6 +1885,7 @@ impl SandboxArgs {
         let has = |namespace| self.isolate.contains(&namespace);
         crate::profile::LinuxIsolateConfig {
             network: has(IsolateNamespace::Net),
+            loopback: has(IsolateNamespace::Loopback),
             ipc: has(IsolateNamespace::Ipc),
             uts: has(IsolateNamespace::Uts),
         }

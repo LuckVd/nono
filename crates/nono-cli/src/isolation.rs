@@ -19,6 +19,7 @@ use nono::{NonoError, Result, Sandbox};
 /// silently stop working, so each is a configuration error instead.
 pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) -> Result<()> {
     let isolate = prepared.isolate;
+    reject_loopback_without_network(isolate).map_err(NonoError::ConfigParse)?;
     if !isolate.network {
         return Ok(());
     }
@@ -40,6 +41,21 @@ pub(crate) fn validate_config(args: &SandboxArgs, prepared: &PreparedSandbox) ->
         conflicts.push("network.no_proxy (hosts that bypass the proxy)");
     }
     reject_direct_grants(&conflicts)
+}
+
+/// `loopback` lifts TCP enforcement on the grounds that the network namespace
+/// confines TCP to its own loopback. Without that namespace it would grant
+/// host-loopback reachability, so it is always an error on its own.
+fn reject_loopback_without_network(isolate: LinuxIsolateConfig) -> std::result::Result<(), String> {
+    if isolate.loopback && !isolate.network {
+        return Err(
+            "linux.isolate.loopback (--isolate loopback) requires linux.isolate.network \
+             (--isolate net): it allows TCP only on the isolated namespace's own loopback, and \
+             without that namespace it would reach host localhost services."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn direct_grants(caps: &CapabilitySet) -> Vec<&'static str> {
@@ -80,8 +96,10 @@ pub(crate) fn prepare_namespaces(
     isolate: LinuxIsolateConfig,
     caps: &CapabilitySet,
 ) -> Result<NamespaceSpec> {
+    reject_loopback_without_network(isolate).map_err(NonoError::SandboxInit)?;
     let mut spec = NamespaceSpec::new()
         .network(isolate.network)
+        .loopback_tcp(isolate.loopback)
         .ipc(isolate.ipc)
         .uts(isolate.uts);
     if isolate.network {
@@ -130,6 +148,10 @@ fn explain_refusal(isolate: LinuxIsolateConfig, stage: NamespaceProbeStage, errn
     };
     let error = if errno == 0 {
         String::from("refused")
+    } else if errno == nix::libc::ENOSPC {
+        // The kernel reports a namespace count limit as ENOSPC, whose strerror
+        // ("No space left on device") reads like a disk problem.
+        String::from("ENOSPC: namespace limit reached")
     } else {
         std::io::Error::from_raw_os_error(errno).to_string()
     };
@@ -137,16 +159,19 @@ fn explain_refusal(isolate: LinuxIsolateConfig, stage: NamespaceProbeStage, errn
         "namespace isolation ({requested}) is not available on this host: {step} failed ({error}).\n\
          Cause: {}\n\
          nono does not fall back to running without the requested isolation.",
-        likely_cause(stage)
+        likely_cause(stage, errno)
     )
 }
 
-fn likely_cause(stage: NamespaceProbeStage) -> String {
+fn likely_cause(stage: NamespaceProbeStage, errno: i32) -> String {
     let sysctl = |name: &str| {
         std::fs::read_to_string(format!("/proc/sys/{name}"))
             .ok()
             .map(|value| value.trim().to_string())
     };
+    if errno == nix::libc::ENOSPC {
+        return namespace_limit_cause(sysctl("user/max_user_namespaces").as_deref());
+    }
     if sysctl("kernel/apparmor_restrict_unprivileged_userns").as_deref() == Some("1") {
         return "AppArmor restricts unprivileged user namespaces \
                 (kernel.apparmor_restrict_unprivileged_userns = 1, Ubuntu 23.10+). Install an \
@@ -182,6 +207,20 @@ fn likely_cause(stage: NamespaceProbeStage) -> String {
         .to_string()
 }
 
+fn namespace_limit_cause(max_user_namespaces: Option<&str>) -> String {
+    match max_user_namespaces {
+        Some("0") => "user namespaces are disabled (user.max_user_namespaces = 0).".to_string(),
+        Some(limit) => format!(
+            "the user namespace limit is reached (user.max_user_namespaces = {limit}). Another \
+             process may be holding or leaking namespaces; raise the limit or stop those \
+             processes."
+        ),
+        None => "a namespace count limit is reached (user.max_user_namespaces or a per-type \
+                 limit under /proc/sys/user)."
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +238,48 @@ mod tests {
         assert_eq!(caps.network_mode(), &NetworkMode::AllowAll);
         let error = prepare_namespaces(isolate_network(), &caps).expect_err("allow-all");
         assert!(error.to_string().contains("allows all traffic"));
+    }
+
+    #[test]
+    fn loopback_without_network_is_rejected_at_launch() {
+        let caps = CapabilitySet::new().set_network_mode(NetworkMode::Blocked);
+        let isolate = LinuxIsolateConfig {
+            loopback: true,
+            ipc: true,
+            ..Default::default()
+        };
+        let error = prepare_namespaces(isolate, &caps).expect_err("loopback without net");
+        assert!(error.to_string().contains("requires linux.isolate.network"));
+    }
+
+    #[test]
+    fn loopback_is_carried_on_the_spec() {
+        let caps = CapabilitySet::new().set_network_mode(NetworkMode::Blocked);
+        let isolate = LinuxIsolateConfig {
+            network: true,
+            loopback: true,
+            ..Default::default()
+        };
+        match prepare_namespaces(isolate, &caps) {
+            Ok(spec) => {
+                assert!(spec.has_network());
+                assert!(spec.loopback_tcp_enabled());
+            }
+            Err(error) => assert!(error.to_string().contains("not available on this host")),
+        }
+    }
+
+    #[test]
+    fn loopback_does_not_relax_direct_grant_rejection() {
+        let mut caps = CapabilitySet::new().set_network_mode(NetworkMode::Blocked);
+        caps.add_localhost_port(5432);
+        let isolate = LinuxIsolateConfig {
+            network: true,
+            loopback: true,
+            ..Default::default()
+        };
+        let error = prepare_namespaces(isolate, &caps).expect_err("direct grants");
+        assert!(error.to_string().contains("open_port"));
     }
 
     #[test]
@@ -257,5 +338,26 @@ mod tests {
         );
         assert!(message.contains("creating the namespaces"));
         assert!(message.contains("does not fall back"));
+    }
+
+    #[test]
+    fn enospc_refusal_names_the_namespace_limit_not_disk_space() {
+        let message = explain_refusal(
+            isolate_network(),
+            NamespaceProbeStage::Unshare,
+            nix::libc::ENOSPC,
+        );
+        assert!(message.contains("namespace limit reached"), "{message}");
+        assert!(!message.contains("No space left on device"), "{message}");
+        assert!(message.contains("max_user_namespaces"), "{message}");
+    }
+
+    #[test]
+    fn namespace_limit_cause_distinguishes_disabled_from_exhausted() {
+        assert!(namespace_limit_cause(Some("0")).contains("disabled"));
+        let exhausted = namespace_limit_cause(Some("125986"));
+        assert!(exhausted.contains("limit is reached"), "{exhausted}");
+        assert!(exhausted.contains("125986"), "{exhausted}");
+        assert!(namespace_limit_cause(None).contains("limit is reached"));
     }
 }

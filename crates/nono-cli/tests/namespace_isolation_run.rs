@@ -191,3 +191,127 @@ fn wrap_rejects_isolation() {
         .assert_failure("nono wrap cannot provide isolation")
         .assert_stderr_contains("nono wrap does not support linux.isolate");
 }
+
+const BLOCKED_LOOPBACK: &str = r#"{"meta":{"name":"iso-loopback"},"network":{"block":true},"linux":{"isolate":{"network":true,"loopback":true}}}"#;
+const PROXIED_LOOPBACK: &str = r#"{"meta":{"name":"iso-proxied-loopback"},"network":{"allow_domain":["example.com"]},"linux":{"isolate":{"network":true,"loopback":true}}}"#;
+
+/// Serves one TCP connection on the namespace loopback, then probes every
+/// path that must stay closed. Prints one `LABEL result` line per check.
+const LOOPBACK_PROBE: &str = r#"
+import errno, os, socket, threading, urllib.parse
+def name(e): return errno.errorcode.get(e.errno, str(e.errno))
+def serve(label, family, host):
+    try:
+        s = socket.socket(family); s.bind((host, 0)); s.listen(1)
+        port = s.getsockname()[1]
+        threading.Thread(target=lambda: s.accept()[0].sendall(b"pong"), daemon=True).start()
+        c = socket.create_connection((host, port), timeout=5)
+        print(label, c.recv(4).decode())
+    except OSError as e:
+        print(label, "denied", name(e))
+serve("LOOP4", socket.AF_INET, "127.0.0.1")
+try:
+    socket.create_connection(("192.0.2.1", 443), timeout=5); print("EGRESS open")
+except OSError as e:
+    print("EGRESS", name(e))
+try:
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print("UDP open")
+except OSError as e:
+    print("UDP", name(e))
+proxy = os.environ.get("HTTP_PROXY")
+if proxy:
+    port = urllib.parse.urlparse(proxy).port
+    for host in ["127.0.0.1", "0.0.0.0"]:
+        try:
+            socket.socket().bind((host, port)); print("PROXYBIND", host, "taken")
+        except OSError as e:
+            print("PROXYBIND", host, name(e))
+"#;
+
+#[test]
+fn isolated_loopback_allows_local_tcp_without_egress() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let t = nono_test!("iso-loopback-blocked");
+    let profile = t.write_profile("iso-loopback", BLOCKED_LOOPBACK);
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(LOOPBACK_PROBE));
+    if host_unsupported(&completed) {
+        return;
+    }
+    let completed = completed.assert_success("isolated loopback run succeeds");
+    let stdout = completed.stdout();
+    assert!(stdout.contains("LOOP4 pong"), "{stdout}");
+    assert!(
+        !stdout.contains("EGRESS open"),
+        "no route out of the namespace: {stdout}"
+    );
+    assert!(stdout.contains("UDP EPERM"), "UDP stays denied: {stdout}");
+}
+
+#[test]
+fn isolated_loopback_cannot_take_the_proxy_port() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let t = nono_test!("iso-loopback-proxied");
+    let profile = t.write_profile("iso-proxied-loopback", PROXIED_LOOPBACK);
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(LOOPBACK_PROBE));
+    if host_unsupported(&completed) {
+        return;
+    }
+    let completed = completed.assert_success("isolated proxied loopback run succeeds");
+    let stdout = completed.stdout();
+    assert!(stdout.contains("LOOP4 pong"), "{stdout}");
+    assert!(!stdout.contains("EGRESS open"), "{stdout}");
+    assert!(
+        stdout.contains("PROXYBIND 127.0.0.1 EADDRINUSE"),
+        "the bridge holds the proxy port: {stdout}"
+    );
+    assert!(
+        stdout.contains("PROXYBIND 0.0.0.0 EADDRINUSE"),
+        "a wildcard bind cannot shadow the bridge: {stdout}"
+    );
+}
+
+#[test]
+fn isolated_network_without_loopback_still_denies_loopback_tcp() {
+    let Some(py) = python3_bin() else {
+        eprintln!("skipping: no system python3 available");
+        return;
+    };
+    let t = nono_test!("iso-no-loopback");
+    let profile = t.write_profile("iso-blocked", BLOCKED_ISOLATED);
+    let completed = t
+        .run()
+        .profile(&profile)
+        .exec(Argv::new(&py).arg("-c").arg(LOOPBACK_PROBE));
+    if host_unsupported(&completed) {
+        return;
+    }
+    completed
+        .assert_success("isolated run succeeds")
+        .assert_stdout_contains("LOOP4 denied");
+}
+
+#[test]
+fn loopback_without_network_isolation_is_rejected() {
+    let t = nono_test!("iso-loopback-alone");
+    let profile = t.write_profile(
+        "iso-loopback-alone",
+        r#"{"meta":{"name":"iso-loopback-alone"},"network":{"block":true},"linux":{"isolate":{"loopback":true}}}"#,
+    );
+    t.run()
+        .profile(&profile)
+        .exec(Argv::new("/bin/true"))
+        .assert_failure("loopback without a network namespace is a configuration error")
+        .assert_stderr_contains("requires linux.isolate.network");
+}

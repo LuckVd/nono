@@ -84,19 +84,37 @@ fn failure(detail: &str) -> NonoError {
     NonoError::SandboxInit(format!("CLONE_FILES bootstrap: {detail}"))
 }
 
+/// Whether the child's network namespace confines TCP to its own loopback
+/// (`linux.isolate.loopback`), so nono's TCP port rules are lifted.
+fn namespace_confines_tcp(config: &ExecConfig<'_>) -> bool {
+    config
+        .namespaces
+        .is_some_and(|spec| spec.has_network() && spec.loopback_tcp_enabled())
+}
+
 fn prepare(
     caps: &CapabilitySet,
     abi: &DetectedAbi,
     policy: LinuxSandboxPolicy,
+    namespace_tcp: bool,
 ) -> Result<PreparedLandlockSandbox> {
-    match policy {
-        LinuxSandboxPolicy::Auto => {
+    match (policy, namespace_tcp) {
+        (LinuxSandboxPolicy::Auto, false) => {
             sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::network_baseline())
         }
-        LinuxSandboxPolicy::External => {
+        // TCP confined by the network namespace: no Landlock TCP rules, but
+        // UDP, raw and non-IP sockets stay denied by the static baseline.
+        (LinuxSandboxPolicy::Auto, true) => sandbox::prepare_seccomp_with_abi(
+            caps,
+            abi,
+            nono::SeccompOpts::external_tcp_with_baseline(),
+        ),
+        // External delegates TCP already; Landlock policy installs no seccomp,
+        // so with loopback it keeps Landlock filesystem rules only.
+        (LinuxSandboxPolicy::External, _) | (LinuxSandboxPolicy::Landlock, true) => {
             sandbox::prepare_seccomp_with_abi(caps, abi, nono::SeccompOpts::external_tcp())
         }
-        LinuxSandboxPolicy::Landlock => sandbox::prepare_landlock_with_abi(caps, abi),
+        (LinuxSandboxPolicy::Landlock, false) => sandbox::prepare_landlock_with_abi(caps, abi),
     }
 }
 
@@ -214,7 +232,12 @@ pub(super) fn spawn(
     if network.is_none() && namespaces.is_none() {
         return Err(failure("nothing requires the raw-clone bootstrap"));
     }
-    let baseline = prepare(caps, &abi, config.sandbox_policy)?;
+    let baseline = prepare(
+        caps,
+        &abi,
+        config.sandbox_policy,
+        namespace_confines_tcp(config),
+    )?;
     let gate = config
         .tool_sandbox_runtime
         .map(|runtime| runtime.prepare_outer_exec_gate())
@@ -310,7 +333,12 @@ pub(super) fn spawn(
         let mut child_caps = caps.clone();
         child_caps.remap_procfs_self_references(pid as u32, None);
         child_caps.widen_procfs_self_to_proc();
-        let prepared = prepare(&child_caps, &abi, config.sandbox_policy)?;
+        let prepared = prepare(
+            &child_caps,
+            &abi,
+            config.sandbox_policy,
+            namespace_confines_tcp(config),
+        )?;
         ruleset = Some(above_stdio(prepared.create_ruleset()?)?);
         let Some(ref ruleset) = ruleset else {
             return Err(failure("missing ruleset"));

@@ -1772,6 +1772,15 @@ pub fn execute_supervised<F: FnMut(i32) -> bool>(
                     )
                     .with_canonical_denial_paths(canonical_denial_paths)
                     .with_network_denials(network_denials);
+                #[cfg(target_os = "linux")]
+                {
+                    base_formatter = base_formatter.with_network_isolated(
+                        config
+                            .namespaces
+                            .as_ref()
+                            .is_some_and(nono::NamespaceSpec::has_network),
+                    );
+                }
                 if let Some(program) = config.command.first() {
                     let argv_display: Vec<String> = config
                         .command

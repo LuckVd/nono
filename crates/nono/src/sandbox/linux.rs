@@ -2870,6 +2870,22 @@ impl SeccompOpts {
         }
     }
 
+    /// Apply Landlock filesystem/process sandboxing, skip nono-managed TCP
+    /// port rules, but still install the static TCP-only socket baseline.
+    ///
+    /// Landlock does not handle TCP bind/connect, so every TCP port is
+    /// allowed. The static filter still denies UDP, raw and non-IP socket
+    /// families, and `io_uring_setup()`, whatever the network mode. Use this
+    /// only when the caller confines TCP reachability by other means, for
+    /// example a network namespace containing nothing but loopback. This
+    /// library does not check that it is.
+    #[must_use]
+    pub fn external_tcp_with_baseline() -> Self {
+        Self {
+            tcp_network: SeccompTcpNetwork::ExternalWithBaseline,
+        }
+    }
+
     /// Apply Landlock filesystem/process sandboxing without installing TCP
     /// policy because the caller has already installed a TCP seccomp filter.
     ///
@@ -2895,6 +2911,7 @@ enum SeccompTcpNetwork {
     Fallback,
     Baseline,
     External,
+    ExternalWithBaseline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2903,11 +2920,14 @@ enum TcpNetworkEnforcement {
     AutoSeccompFallback,
     SeccompBaseline,
     External,
+    /// TCP confined by the caller; the static TCP-only socket baseline
+    /// still applies.
+    ExternalWithBaseline,
 }
 
 impl TcpNetworkEnforcement {
     fn handles_tcp(self) -> bool {
-        !matches!(self, Self::External)
+        !matches!(self, Self::External | Self::ExternalWithBaseline)
     }
 
     fn allows_seccomp_fallback(self) -> bool {
@@ -2915,7 +2935,7 @@ impl TcpNetworkEnforcement {
     }
 
     fn installs_static_baseline(self) -> bool {
-        matches!(self, Self::SeccompBaseline)
+        matches!(self, Self::SeccompBaseline | Self::ExternalWithBaseline)
     }
 }
 
@@ -2925,6 +2945,7 @@ impl From<SeccompTcpNetwork> for TcpNetworkEnforcement {
             SeccompTcpNetwork::Fallback => Self::AutoSeccompFallback,
             SeccompTcpNetwork::Baseline => Self::SeccompBaseline,
             SeccompTcpNetwork::External => Self::External,
+            SeccompTcpNetwork::ExternalWithBaseline => Self::ExternalWithBaseline,
         }
     }
 }
@@ -2988,6 +3009,10 @@ fn selected_static_network_filter(
 ) -> StaticNetworkFilter {
     if matches!(fallback, SeccompNetFallback::BlockAll) {
         StaticNetworkFilter::BlockAll
+    } else if matches!(tcp_network, TcpNetworkEnforcement::ExternalWithBaseline) {
+        // TCP is confined by the caller, so TCP sockets must be creatable
+        // even in Blocked mode; every other socket class stays denied.
+        StaticNetworkFilter::TcpOnly
     } else if tcp_network.installs_static_baseline() {
         static_network_baseline_filter(caps)
     } else {
@@ -5141,6 +5166,58 @@ mod tests {
         assert!(!preinstalled.handles_tcp());
         assert!(!preinstalled.allows_seccomp_fallback());
         assert!(!preinstalled.installs_static_baseline());
+
+        let external_baseline: TcpNetworkEnforcement =
+            SeccompOpts::external_tcp_with_baseline().tcp_network.into();
+        assert!(!external_baseline.handles_tcp());
+        assert!(!external_baseline.allows_seccomp_fallback());
+        assert!(external_baseline.installs_static_baseline());
+    }
+
+    /// External TCP with baseline: Landlock handles no TCP and installs no
+    /// port rules, but the TCP-only socket filter applies in every confined
+    /// network mode (Blocked included), so UDP, raw and netlink stay denied.
+    #[test]
+    fn external_tcp_with_baseline_lifts_tcp_rules_but_keeps_tcp_only_filter() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let abi = DetectedAbi::new(ABI::V6);
+        for caps in [
+            CapabilitySet::new().block_network(),
+            CapabilitySet::new().proxy_only(8080),
+        ] {
+            let caps = caps
+                .allow_path(temp.path(), AccessMode::Read)
+                .expect("path capability");
+            let prepared =
+                prepare_seccomp_with_abi(&caps, &abi, SeccompOpts::external_tcp_with_baseline())
+                    .expect("prepare external-with-baseline policy");
+            assert_eq!(
+                prepared.attr.handled_access_net,
+                0,
+                "{:?}",
+                caps.network_mode()
+            );
+            assert!(prepared.net_rules.is_empty());
+            assert_eq!(prepared.fallback(), &SeccompNetFallback::None);
+            assert_eq!(
+                prepared.static_network_filter,
+                StaticNetworkFilter::TcpOnly,
+                "{:?}",
+                caps.network_mode()
+            );
+        }
+
+        // The plain baseline still blocks every non-Unix socket in Blocked mode.
+        let blocked = CapabilitySet::new()
+            .block_network()
+            .allow_path(temp.path(), AccessMode::Read)
+            .expect("path capability");
+        let baseline = prepare_seccomp_with_abi(&blocked, &abi, SeccompOpts::network_baseline())
+            .expect("prepare baseline policy");
+        assert_eq!(
+            baseline.static_network_filter,
+            StaticNetworkFilter::BlockAll
+        );
     }
 
     #[test]
