@@ -940,6 +940,7 @@ impl<'a> DiagnosticFormatter<'a> {
 
     /// Mark the session as running in an isolated network namespace, so
     /// network grant help suggests `--allow-domain` instead of `--allow-net`.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn with_network_isolated(mut self, isolated: bool) -> Self {
         self.network_isolated = isolated;
@@ -3987,6 +3988,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_network_isolated_suggests_allow_domain_not_allow_net() {
         // --allow-net is rejected alongside linux.isolate.network, so the hint
         // must point at the only remedy that can work: proxied access.

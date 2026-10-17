@@ -2396,6 +2396,7 @@ impl LinuxIsolateConfig {
     }
 
     /// Short names of the requested namespaces, for diagnostics.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn labels(&self) -> Vec<&'static str> {
         [
@@ -7342,6 +7343,7 @@ mod tests {
         )
         .expect("parse");
         assert!(profile.linux.isolate.loopback);
+        #[cfg(target_os = "linux")]
         assert_eq!(profile.linux.isolate.labels(), vec!["net", "loopback"]);
 
         let mut base = base_profile();

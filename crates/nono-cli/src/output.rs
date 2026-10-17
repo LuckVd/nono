@@ -510,8 +510,6 @@ pub fn print_abi_info(silent: bool) {
     }
 }
 
-/// Print the Landlock scope policy derived from the current capabilities.
-#[cfg(target_os = "linux")]
 /// Print the requested namespace isolation set (NEP-0004), if any.
 #[cfg(target_os = "linux")]
 pub fn print_isolation(isolate: crate::profile::LinuxIsolateConfig, silent: bool) {
@@ -536,6 +534,8 @@ pub fn print_isolation(isolate: crate::profile::LinuxIsolateConfig, silent: bool
     );
 }
 
+/// Print the Landlock scope policy derived from the current capabilities.
+#[cfg(target_os = "linux")]
 pub fn print_landlock_scope_policy(caps: &CapabilitySet, verbose: u8, silent: bool) {
     if silent || verbose == 0 {
         return;
