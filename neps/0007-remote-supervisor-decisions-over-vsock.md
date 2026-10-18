@@ -21,11 +21,11 @@ full guest compromise does not yield them.
 
 ## Motivation
 
-[security-model.mdx](../docs/cli/internals/security-model.mdx) recommends
-putting nono inside a microVM for hostile-code and multi-tenant deployments
-("Composing with an outer boundary"). Today that composition is all-or-nothing:
-the whole supervisor runs in the guest. If an attacker escapes Landlock and
-seccomp through a guest kernel bug, they own the guest, and with it:
+To date we have recommended nono be combined with a nicroVM for hostile-code 
+nd multi-tenant deployments ("Composing with an outer boundary"). Today that
+composition is all-or-nothing: the whole supervisor runs in the guest. If an
+attacker escapes Landlock and seccomp through a guest kernel bug, they own
+the guest, and with it:
 
 - the credentials the supervisor or its proxy hold (in guest memory, and in
   every memory snapshot of the guest);
@@ -181,14 +181,6 @@ sandboxed workload restricted to that endpoint can reach the host-side
 credential proxy. The spike used a small bridge outside the sandbox; this NEP
 proposes building it into nono (see Open Questions for the shape).
 
-**The sandboxed child must not reach vsock.** The decider and proxy ports are
-meant for the supervisor and the egress bridge, not for the workload. When a
-`vsock` backend or a vsock egress bridge is configured, the sandboxed child
-must be denied `socket(AF_VSOCK, ...)` by its seccomp filter, regardless of
-the profile's network settings (Landlock has no vsock rules). Only the
-supervisor (and the bridge, which runs outside the sandbox) open vsock
-connections. The spike did not implement this; see Security Considerations.
-
 ### 3. Audit (`nono` library, mechanism)
 
 **Shared, resumable chains.** `AuditRecorder::open_shared(session_dir)`
@@ -289,26 +281,6 @@ on Substrate's own:
   egress from the guest failed.
 - On gVisor (no Landlock), nono refused to start, so nothing ran unsandboxed.
 
-Not yet validated, and required before `proposed`:
-
-- Whether a sandboxed process can open `AF_VSOCK` sockets in each network
-  mode, and whether it can reach other vsock services in the guest (for
-  example a VM agent listening on the guest's own CID). See Security
-  Considerations.
-- Snapshot modes other than full memory snapshots: volume-only and
-  rootfs-only snapshots, where the guest cold-boots and nono starts afresh.
-- Long suspensions (hours to days): guest clock jumps, decision expiry, and
-  platform certificate lifetimes.
-- Cloning a running workload from a snapshot (forking) and reverting to an
-  earlier snapshot while the host-side chain has moved on.
-- A host or VM crash while a decision is pending.
-- Malformed and adversarial input to the host side (fuzzing the framing and
-  JSON, connection floods) and to the per-VM proxy.
-- Scale: per-workload overhead inside the VM, many workloads per host, and
-  resume bursts.
-
-All results so far come from one single-node cluster.
-
 ## Security Considerations
 
 **Least privilege.** The sandboxed process gains nothing: enforcement in the
@@ -351,17 +323,6 @@ local process that can connect could obtain decisions. On Substrate the socket
 lives in the worker container's private filesystem. Deployments must verify
 this, and the host side should refuse to serve a socket it cannot attribute to
 one VM.
-
-**Guest access to vsock.** vsock is not covered by Landlock, and today's
-seccomp network filters only block non-Unix sockets in some network modes. If
-the sandboxed child can open `AF_VSOCK` it can talk to the decider directly:
-it cannot grant itself anything (the guest supervisor applies decisions), but
-it can submit forged requests that end up in the host-side audit log and
-consume the host side's capacity. It may also reach other vsock services in
-the guest, such as a VM agent listening on the guest's own CID, which would be
-outside nono's model entirely. The proposal therefore requires denying
-`AF_VSOCK` to the sandboxed child whenever vsock is in use (see Proposal). This
-has not yet been verified on a real guest; it is the first item to validate.
 
 **Concurrency.** Worker threads only call the backend; all actions on the
 seccomp notify fd stay on the supervisor thread, so a worker can never act on
@@ -407,7 +368,6 @@ orchestration and configuration stay in `nono-cli` or the host component.
 3. Shares into the guest (virtio-fs) are as narrow as capabilities would be.
 4. The host listener is authenticated as above.
 5. Guest-reported context is treated as untrusted.
-6. The sandboxed child cannot open vsock sockets.
 
 ## Alternatives Considered
 
@@ -438,7 +398,7 @@ expected to break at every suspend.
 
 ## Open Questions
 
-- **Shape of the host component**: a `nono host` (or `nono decide`)
+- **CLI ops of the host component**: a `nono host` (or `nono decide`)
   subcommand, a separate binary in this workspace, or a library others embed
   in platform code.
 - **Policy source and format on the host**: per-workload profiles keyed by
@@ -457,11 +417,6 @@ expected to break at every suspend.
   expired" back to the decider (a supervisor-to-backend callback).
 - **Per-VM host limits**: connection and rate limits, and their defaults.
 - **macOS hosts with Linux guests** (Virtualization.framework vsock).
-- **vsock exposure**: verify which network modes already deny `AF_VSOCK` to
-  the child, which other vsock services a guest exposes (VM agents, debug
-  consoles), and whether the host side should also authenticate the
-  supervisor itself (for example a per-boot secret handed over before the
-  sandbox starts) as defence in depth.
 - **Platform extension points**: today the spike relies on VMM socket layout
   and runs inside the platform's worker container. Supported hooks (a vsock
   service-port mechanism, a sidecar slot) should be requested from platforms.
