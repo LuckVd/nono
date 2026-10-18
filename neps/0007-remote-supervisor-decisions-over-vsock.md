@@ -21,11 +21,9 @@ full guest compromise does not yield them.
 
 ## Motivation
 
-To date we have recommended nono be combined with a nicroVM for hostile-code 
-nd multi-tenant deployments ("Composing with an outer boundary"). Today that
+To date we have recommended nono be combined with a nicroVM for hostile-code and multi-tenant deployments ("Composing with an outer boundary"). At present that
 composition is all-or-nothing: the whole supervisor runs in the guest. If an
-attacker escapes Landlock and seccomp through a guest kernel bug, they own
-the guest, and with it:
+attacker escapes Landlock and seccomp through a guest kernel bug, they own the guest, and with it:
 
 - the credentials the supervisor or its proxy hold (in guest memory, and in
   every memory snapshot of the guest);
@@ -33,15 +31,16 @@ the guest, and with it:
 - the audit log (it can be rewritten or suppressed before it leaves the guest);
 - every approval decision (the attacker can answer its own requests).
 
-The VM still protects the host, but the assets worth stealing from an agent
-deployment — credentials, egress and an honest record — are lost.
+This is not a suprise as we modelled nono on the premise of trusting userspace, not agent space, but a MicroVM swaps things around and now the entire guest can be argued to be 'untrusted'.
 
-Orchestrated agent platforms make this concrete. On Agent Substrate (Kata
+The VM still protects the host, but the assets worth stealing from an agent deployment — credentials, egress and an honest record — are lost.
+
+Orchestrated agent platforms such as Agent Substrate (Kata
 microVMs on Cloud Hypervisor, driven by Kubernetes), actors are suspended,
 snapshotted to object storage, restored and moved between worker pods many
 times over their life, and thousands of them run per cluster. Anything kept in
-guest memory is copied into snapshot storage. Firecracker-based systems have
-the same shape.
+guest memory is copied into snapshot storage. 
+
 
 The supervisor cannot simply be moved out of the guest: its enforcement half
 depends on primitives that only exist in the guest kernel (the seccomp notify
@@ -179,7 +178,7 @@ synchronously.
 (e.g. `127.0.0.1:3128`) that forwards to vsock CID 2, a configured port, so a
 sandboxed workload restricted to that endpoint can reach the host-side
 credential proxy. The spike used a small bridge outside the sandbox; this NEP
-proposes building it into nono (see Open Questions for the shape).
+proposes building it into nono (see Open Questions).
 
 ### 3. Audit (`nono` library, mechanism)
 
@@ -210,8 +209,7 @@ unknown, not that the decision was not applied.
 
 ### 4. Host side (new nono component)
 
-A host-side component (the spike's `vsock_decider`; final shape is an Open
-Question) that, per VM:
+A host-side component (the spike's `vsock_decider`):
 
 - **Listens** on the hybrid-vsock host socket for the guest's decision port
   (Firecracker and Cloud Hypervisor map a guest connection to vsock port N
