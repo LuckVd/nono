@@ -74,10 +74,6 @@ need to.
   via virtio-fs or hotplug). Different problem, weakest payoff.
 - Interactive human approval from the host. The protocol carries any
   `ApprovalRequest`, but this NEP targets automatic policy decisions.
-- macOS hosts running Seatbelt workloads. The guest side is Linux-only (it
-  relies on Landlock and seccomp user-notify). A macOS host running Linux
-  guests under Virtualization.framework (which offers vsock) is an Open
-  Question, not a goal.
 - Multi-host audit ledgers (one chain across nodes). See Open Questions.
 - Platform-specific integration code in nono (Kubernetes, Substrate CRDs).
 
@@ -248,8 +244,6 @@ SIGTERM).
 
 - **Linux guest:** as above. Landlock and seccomp semantics are unchanged; no
   deny-within-allow is introduced.
-- **macOS:** not applicable to Seatbelt workloads. Nothing changes for macOS
-  users; the `vsock` backend type is rejected at runtime on non-Linux.
 - **Hosts:** any VMM exposing hybrid vsock (Firecracker, Cloud Hypervisor).
 
 ### Backward compatibility
@@ -414,7 +408,6 @@ expected to break at every suspend.
 - **Applied-outcome reporting**: whether to report "fd injected / notification
   expired" back to the decider (a supervisor-to-backend callback).
 - **Per-VM host limits**: connection and rate limits, and their defaults.
-- **macOS hosts with Linux guests** (Virtualization.framework vsock).
 - **Platform extension points**: today the spike relies on VMM socket layout
   and runs inside the platform's worker container. Supported hooks (a vsock
   service-port mechanism, a sidecar slot) should be requested from platforms.
