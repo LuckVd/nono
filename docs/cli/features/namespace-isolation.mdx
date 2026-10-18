@@ -3,7 +3,7 @@ title: Namespace Isolation (Linux)
 description: Opt-in user, network, IPC, and UTS namespaces that structurally remove local IPC and direct-network escape paths
 ---
 
-Namespace isolation is an opt-in Linux layer that runs the sandboxed command inside new kernel namespaces, on top of the normal Landlock and seccomp sandbox. It is off by default and always will be. See [NEP-0004](https://github.com/nolabs-ai/nono/blob/main/neps/0004-opt-in-linux-namespace-isolation.md) for the design.
+Namespace isolation is an opt-in Linux layer that runs the sandboxed command inside new kernel namespaces, on top of the normal Landlock and seccomp sandbox. It is off by default and must be explicitly enabled with the `--isolate` flag or the corresponding profile settings.
 
 ```bash
 # Network namespace with no route out; ipc and uts namespaces too
@@ -68,12 +68,12 @@ With `loopback`, the command can bind, listen, and connect on any TCP port on `1
 
 ## Networking inside the namespace
 
-The isolated network has no route to the host or the internet. The only way out is the session proxy:
+The isolated network has no route to the host or the internet. The only way out is via the session proxy:
 
-- **`--block-net`**: no proxy and no bridge. The command has loopback only.
-- **Proxied networking** (`--allow-domain`, `--network-profile`, credentials): nono creates a loopback listener *inside* the namespace on the proxy's port and serves it from the supervisor. `HTTP_PROXY`, `HTTPS_PROXY`, and credential base URLs are unchanged. Domain filtering, credential injection, and proxy authentication work exactly as they do without isolation.
+- **Network blocking:**`--block-net` results in no proxy and no bridge - loopback only.
+- **Proxied networking:** `--allow-domain`, `--network-profile`, credentials etc: A loopback listener *inside* the namespace on the proxy's port which is served from the supervisor.
 
-Because the namespace has no other way out, these combinations are **startup errors** rather than silently broken:
+Because the namespace has no other way out, the following combinations produce **startup errors** for safe informative failure, rather than silent.
 
 | Combination | Why it fails |
 |---|---|
@@ -85,13 +85,13 @@ Because the namespace has no other way out, these combinations are **startup err
 
 ## Merging and precedence
 
-`linux.isolate` fields merge by logical OR across `extends`, packs, and the CLI. Any layer can turn a namespace on, and no layer can turn one off. `--isolate` adds to a profile's isolation; it cannot remove it. If you do not want a pack's isolation, do not use that pack.
+`linux.isolate` fields merge by logical OR across `extends`, packs, and the CLI. Any layer can turn a namespace on, and no layer can turn one off. `--isolate` adds to a profile's isolation; it cannot remove it.
 
 ## Host requirements and failure
 
-nono probes the host at startup by actually creating the namespaces in a scratch process. If the host refuses, nono stops with an error that names the step that failed and the likely cause. It never runs your command without the isolation you asked for.
+nono probes the host at startup by actually creating the namespaces in a scratch process. If the host refuses, nono stops with an error that names the step that failed and the likely cause.
 
-Common causes:
+Some common causes include:
 
 - **Ubuntu 23.10 and later** restrict unprivileged user namespaces with AppArmor (`kernel.apparmor_restrict_unprivileged_userns = 1`). Allow nono specifically by installing an AppArmor profile, for example `/etc/apparmor.d/nono`:
 
