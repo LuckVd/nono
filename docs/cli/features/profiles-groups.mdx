@@ -429,6 +429,7 @@ The `network` section controls network access and credential injection.
     "allow_domain": ["my-internal-api.example.com"],
     "open_port": [3000],
     "listen_port": [8080],
+    "listen_port_range": [[9000, 9010]],
     "no_proxy": ["redis"],
     "credentials": ["openai", "anthropic"],
     "upstream_proxy": "squid.corp:3128",
@@ -452,6 +453,7 @@ The `network` section controls network access and credential injection.
 | `allow_domain` | Additional domains to allow through the proxy |
 | `open_port` | Localhost TCP ports to allow bidirectional IPC (equivalent to `--open-port`) |
 | `listen_port` | TCP ports the sandboxed child may listen on (equivalent to `--listen-port`) |
+| `listen_port_range` | Inclusive TCP port ranges the sandboxed child may listen on (bind only), e.g. `[[9000, 9010]]`. Multiple ranges are allowed; overlapping ranges are merged automatically |
 | `no_proxy` | Additional client-side `NO_PROXY` / `no_proxy` host patterns in proxy mode; supports safe single-label local aliases, canonical IPs, and explicit suffix patterns; does not grant network access, so direct connections still require matching sandbox permissions; entries overlapping route upstreams or `allow_domain` fail configuration so proxy-enforced routes cannot be bypassed |
 | `credentials` | Credential services to enable via reverse proxy (e.g., `openai`, `anthropic`) |
 | `custom_credentials` | Custom credential service definitions for APIs not in the built-in list |
